@@ -1,0 +1,1016 @@
+# =============================================================================
+# reTerminal E1003 - Smart Workspace Dashboard V2
+#
+# UI direction:
+#   - High information density, e-paper friendly
+#   - Office scene bitmap in header
+#   - Real: HA light state / brightness
+#   - Real: onboard temperature / humidity
+#   - Fake/demo: meeting rooms / CO2 / PM2.5 / climate / energy / quick actions
+#   - Only the Main Light toggle and brightness presets are interactive
+#   - Static symbols such as arrows and climate +/- are visual hints only
+#
+# Target:
+#   - reTerminal E1003, IT8951 1872x1404 16-level grayscale
+#   - GT911 touch
+#   - SHT4x
+#   - PCF8563 RTC
+#   - Home Assistant Native API
+#
+# Put this file beside:
+#   assets/office_scene.png
+#
+# Requires ESPHome >= 2026.7.0
+# =============================================================================
+
+substitutions:
+  device_name: reterminal-e1003-ha
+  friendly_name: "E1003 Smart Workspace"
+  ha_light_entity: light.deskside_lamp
+
+  # ---- Reachy 机器人控制区(交互式服务调用,无需机器人可整体删除) ----
+  reachy_service: script.reachy_cmd
+  reachy_text_retail: "介绍一下智慧零售"
+  reachy_text_space: "介绍一下智慧空间"
+  reachy_text_rescue: "介绍一下应急救灾"
+  reachy_text_stop: "停止"
+
+
+# =============================================================================
+# ESPHOME / ESP32
+# =============================================================================
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+  includes:
+    - assets/dashboard_static_v4.h
+
+  on_boot:
+    priority: -100
+    then:
+      - component.update: sht4x_sensor
+      - pcf8563.read_time:
+      - delay: 3s
+
+      # First boot paint is always a full high-quality grayscale refresh.
+      - lambda: |-
+          id(ui_full_redraw) = true;
+
+      - it8951.update:
+          id: epaper_display
+          mode: GC16
+
+      - lambda: |-
+          id(ui_ready) = true;
+
+
+esp32:
+  board: seeed_xiao_esp32s3
+  framework:
+    type: arduino
+
+
+psram:
+  mode: octal
+
+
+logger:
+  hardware_uart: UART0
+  level: DEBUG
+
+
+# =============================================================================
+# HOME ASSISTANT / OTA / WIFI
+# =============================================================================
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "E1003-Recovery"
+    password: "ChangeMe123"
+
+
+captive_portal:
+
+
+# =============================================================================
+# UI STATE
+# =============================================================================
+
+globals:
+  - id: ui_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: ui_full_redraw
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  - id: ui_time_dirty
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: ui_env_dirty
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: ui_light_dirty
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: ui_light_last_refresh
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+
+# =============================================================================
+# FONTS
+# =============================================================================
+
+font:
+  - file: "C:/Windows/Fonts/arial.ttf"
+    id: font_tiny
+    size: 20
+
+  - file: "C:/Windows/Fonts/arial.ttf"
+    id: font_small
+    size: 24
+
+  - file: "C:/Windows/Fonts/arial.ttf"
+    id: font_body
+    size: 28
+
+  - file: "C:/Windows/Fonts/arialbd.ttf"
+    id: font_medium
+    size: 36
+
+  - file: "C:/Windows/Fonts/arialbd.ttf"
+    id: font_large
+    size: 48
+
+  - file: "C:/Windows/Fonts/arialbd.ttf"
+    id: font_number
+    size: 110
+
+  - file: "C:/Windows/Fonts/arialbd.ttf"
+    id: font_clock
+    size: 90
+
+
+# =============================================================================
+# STATIC DASHBOARD ASSET
+# =============================================================================
+
+# dashboard_static.h is a PackBits-compressed 4bpp bitmap.
+# It avoids ESPHome's image conversion path on Windows.
+
+# =============================================================================
+# HARDWARE BUS / BUZZER
+# =============================================================================
+
+spi:
+  id: epaper_spi_bus
+  clk_pin: GPIO7
+  mosi_pin: GPIO9
+  miso_pin: GPIO8
+
+
+i2c:
+  scl: GPIO20
+  sda: GPIO19
+
+
+output:
+  - platform: ledc
+    pin: GPIO45
+    id: buzzer_pwm
+    frequency: 1000Hz
+
+
+light:
+  - platform: monochromatic
+    output: buzzer_pwm
+    name: "Buzzer"
+    id: buzzer
+    default_transition_length: 0s
+
+
+# =============================================================================
+# SENSORS
+# =============================================================================
+
+sensor:
+  - platform: sht4x
+    id: sht4x_sensor
+
+    temperature:
+      name: "Workspace Temperature"
+      id: temp_sensor
+
+      on_value:
+        then:
+          - logger.log:
+              format: "Temperature updated: %.1f C"
+              args:
+                - id(temp_sensor).state
+
+          # Do not refresh immediately here because SHT4x temperature and
+          # humidity arrive almost together. The 60s UI interval below
+          # coalesces them into one environment refresh.
+          - lambda: |-
+              id(ui_env_dirty) = true;
+
+    humidity:
+      name: "Workspace Humidity"
+      id: hum_sensor
+
+      on_value:
+        then:
+          - logger.log:
+              format: "Humidity updated: %.1f %%"
+              args:
+                - id(hum_sensor).state
+
+          - lambda: |-
+              id(ui_env_dirty) = true;
+
+    update_interval: 60s
+
+
+  - platform: homeassistant
+    id: ha_light_brightness
+    entity_id: ${ha_light_entity}
+    attribute: brightness
+    internal: true
+
+    on_value:
+      then:
+        - logger.log:
+            format: "HA light brightness: %.0f"
+            args:
+              - id(ha_light_brightness).state
+
+        - if:
+            condition:
+              lambda: |-
+                if (!id(ui_ready)) return false;
+                auto now = id(rtc_time).now();
+                if (!now.is_valid()) return false;
+                uint32_t ts = now.timestamp;
+                if (ts - id(ui_light_last_refresh) < 2) return false;
+                id(ui_light_last_refresh) = ts;
+                return true;
+            then:
+              - lambda: |-
+                  id(ui_light_dirty) = true;
+
+              - delay: 180ms
+
+              # Use DU for faster partial refresh
+              - it8951.update:
+                  id: epaper_display
+                  mode: DU
+
+
+# =============================================================================
+# HOME ASSISTANT LIGHT STATE
+# =============================================================================
+
+text_sensor:
+  - platform: homeassistant
+    id: ha_light_state
+    entity_id: ${ha_light_entity}
+    internal: true
+
+    on_value:
+      then:
+        - logger.log:
+            format: "HA light state: %s"
+            args:
+              - id(ha_light_state).state.c_str()
+
+        - if:
+            condition:
+              lambda: |-
+                if (!id(ui_ready)) return false;
+                auto now = id(rtc_time).now();
+                if (!now.is_valid()) return false;
+                uint32_t ts = now.timestamp;
+                if (ts - id(ui_light_last_refresh) < 2) return false;
+                id(ui_light_last_refresh) = ts;
+                return true;
+            then:
+              - lambda: |-
+                  id(ui_light_dirty) = true;
+
+              - delay: 180ms
+
+              - it8951.update:
+                  id: epaper_display
+                  mode: DU
+
+
+# =============================================================================
+# RTC / HOME ASSISTANT TIME
+# =============================================================================
+
+time:
+  - platform: pcf8563
+    id: rtc_time
+    address: 0x51
+    update_interval: never
+
+  - platform: homeassistant
+    id: ha_time
+    timezone: Asia/Shanghai
+
+    on_time_sync:
+      then:
+        - pcf8563.write_time:
+        - logger.log: "Home Assistant time synchronized to PCF8563"
+
+        - if:
+            condition:
+              lambda: |-
+                return id(ui_ready);
+            then:
+              - lambda: |-
+                  id(ui_time_dirty) = true;
+
+              - it8951.update:
+                  id: epaper_display
+                  mode: DU
+
+    on_time:
+      - minutes: '*'
+        seconds: 0
+        then:
+          - if:
+              condition:
+                lambda: |-
+                  return id(ui_ready);
+              then:
+                - lambda: |-
+                    id(ui_time_dirty) = true;
+
+                # Time is pure black/white and is ideal for a fast DU partial.
+                - it8951.update:
+                    id: epaper_display
+                    mode: DU
+
+
+# Environment UI refresh: once per minute, separately from the clock so that
+# the driver's dirty bounding box stays local to the Environment card.
+interval:
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(ui_ready) && id(ui_env_dirty);
+          then:
+            - it8951.update:
+                id: epaper_display
+                mode: DU
+
+
+# =============================================================================
+# TOUCHSCREEN
+# =============================================================================
+#
+# The proven E1003 orientation reports X mirrored relative to the visual UI.
+# Convert raw touch X back into visual/display coordinates with:
+#     x = 1872 - touch.x
+#
+# Only the Main Light toggle and 25/50/75/100 buttons are active.
+
+touchscreen:
+  - platform: gt911
+    id: e1003_touch
+    display: epaper_display
+    interrupt_pin: GPIO2
+    reset_pin: GPIO48
+
+    transform:
+      mirror_x: true
+
+    on_touch:
+      - logger.log:
+          format: "Touch raw=(%d,%d) UI=(%d,%d)"
+          args:
+            - touch.x
+            - touch.y
+            - 1872 - touch.x
+            - touch.y
+
+      # -----------------------------------------------------------------------
+      # MAIN LIGHT TOGGLE
+      # Visual UI: x=1630..1785, y=390..470
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1569 && x <= 1774 &&
+                     y >= 513  && y <= 604;
+
+          then:
+            - logger.log: "UI: Main Light toggle"
+
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+
+            - delay: 80ms
+            - light.turn_off: buzzer
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(ha_light_state).has_state() &&
+                           id(ha_light_state).state == "on";
+                then:
+                  - homeassistant.service:
+                      service: light.turn_off
+                      data:
+                        entity_id: ${ha_light_entity}
+                else:
+                  - homeassistant.service:
+                      service: light.turn_on
+                      data:
+                        entity_id: ${ha_light_entity}
+
+
+      # -----------------------------------------------------------------------
+      # BRIGHTNESS 25%
+      # Visual UI: x=1280..1395, y=555..620
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1229 && x <= 1346 &&
+                     y >= 711  && y <= 784;
+          then:
+            - logger.log: "UI: Brightness 25%%"
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+            - homeassistant.service:
+                service: light.turn_on
+                data:
+                  entity_id: ${ha_light_entity}
+                  brightness_pct: "25"
+
+
+      # -----------------------------------------------------------------------
+      # BRIGHTNESS 50%
+      # Visual UI: x=1405..1520, y=555..620
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1359 && x <= 1478 &&
+                     y >= 711  && y <= 784;
+          then:
+            - logger.log: "UI: Brightness 50%%"
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+            - homeassistant.service:
+                service: light.turn_on
+                data:
+                  entity_id: ${ha_light_entity}
+                  brightness_pct: "50"
+
+
+      # -----------------------------------------------------------------------
+      # BRIGHTNESS 75%
+      # Visual UI: x=1530..1645, y=555..620
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1490 && x <= 1607 &&
+                     y >= 711  && y <= 784;
+          then:
+            - logger.log: "UI: Brightness 75%%"
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+            - homeassistant.service:
+                service: light.turn_on
+                data:
+                  entity_id: ${ha_light_entity}
+                  brightness_pct: "75"
+
+
+      # -----------------------------------------------------------------------
+      # BRIGHTNESS 100%
+      # Visual UI: x=1655..1785, y=555..620
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1620 && x <= 1738 &&
+                     y >= 711  && y <= 784;
+          then:
+            - logger.log: "UI: Brightness 100%%"
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+            - homeassistant.service:
+                service: light.turn_on
+                data:
+                  entity_id: ${ha_light_entity}
+                  brightness_pct: "100"
+
+      # -----------------------------------------------------------------------
+      # REACHY - RETAIL INTRO
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1375 && x <= 1515 &&
+                     y >= 970  && y <= 1095;
+          then:
+            - logger.log: "UI: Reachy Retail Intro"
+
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+
+            - homeassistant.service:
+                service: ${reachy_service}
+                data:
+                  task: inject
+                  text: ${reachy_text_retail}
+
+
+      # -----------------------------------------------------------------------
+      # REACHY - SPACE INTRO
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1516 && x <= 1654 &&
+                     y >= 970  && y <= 1095;
+          then:
+            - logger.log: "UI: Reachy Space Intro"
+
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+
+            - homeassistant.service:
+                service: ${reachy_service}
+                data:
+                  task: inject
+                  text: ${reachy_text_space}
+
+
+      # -----------------------------------------------------------------------
+      # REACHY - RESCUE INTRO
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1655 && x <= 1815 &&
+                     y >= 970  && y <= 1095;
+          then:
+            - logger.log: "UI: Reachy Rescue Intro"
+
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+
+            - homeassistant.service:
+                service: ${reachy_service}
+                data:
+                  task: inject
+                  text: ${reachy_text_rescue}
+
+
+      # -----------------------------------------------------------------------
+      # REACHY - STOP
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1375 && x <= 1515 &&
+                     y >= 1096 && y <= 1225;
+          then:
+            - logger.log: "UI: Reachy Stop"
+
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+
+            - homeassistant.service:
+                service: ${reachy_service}
+                data:
+                  task: inject
+                  text: ${reachy_text_stop}
+
+
+      # -----------------------------------------------------------------------
+      # REACHY - WAKE
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1516 && x <= 1654 &&
+                     y >= 1096 && y <= 1225;
+          then:
+            - logger.log: "UI: Reachy Wake"
+
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+
+            - homeassistant.service:
+                service: ${reachy_service}
+                data:
+                  task: wake-now
+
+
+      # -----------------------------------------------------------------------
+      # REACHY - LANGUAGE
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: |-
+              const int x = 1872 - touch.x;
+              const int y = touch.y;
+              return x >= 1655 && x <= 1815 &&
+                     y >= 1096 && y <= 1225;
+          then:
+            - logger.log: "UI: Reachy Language"
+
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 80ms
+            - light.turn_off: buzzer
+
+            - homeassistant.service:
+                service: ${reachy_service}
+                data:
+                  task: lang-toggle
+
+# =============================================================================
+# E-PAPER DISPLAY - V4 APPROVED STATIC ART + MINIMAL DYNAMIC OVERLAYS
+# =============================================================================
+
+display:
+  - platform: it8951
+    id: epaper_display
+    spi_id: epaper_spi_bus
+    model: seeed-reterminal-e1003
+
+    update_interval: never
+    auto_clear_enabled: false
+
+    grayscale: true
+    dithering: false
+
+    update_mode: GC16
+    full_update_every: 120
+
+    transform:
+      mirror_x: true
+      mirror_y: false
+
+    lambda: |-
+      const Color BLACK = Color::BLACK;
+      const Color WHITE = Color::WHITE;
+      const Color G2 = Color(225, 225, 225);
+      const Color G3 = Color(185, 185, 185);
+      const Color G5 = Color(75, 75, 75);
+
+      // ----------------------------------------------------------------------
+      // Decode the user's approved static dashboard.
+      // Source was 1448x1086 (exactly 4:3) and was converted to 1872x1404.
+      // The white holes in the source are intentionally preserved.
+      // ----------------------------------------------------------------------
+      auto draw_static_dashboard = [&]() {
+        int src_i = 0;
+        int packed_index = 0;
+
+        auto emit_byte = [&](uint8_t packed) {
+          int pixel_index = packed_index * 2;
+          int y = pixel_index / DASHBOARD_V4_WIDTH;
+          int x = pixel_index - y * DASHBOARD_V4_WIDTH;
+
+          uint8_t hi = (packed >> 4) & 0x0F;
+          uint8_t lo = packed & 0x0F;
+
+          uint8_t g0 = hi * 17;
+          uint8_t g1 = lo * 17;
+
+          it.draw_pixel_at(x, y, Color(g0, g0, g0));
+
+          if (x + 1 < DASHBOARD_V4_WIDTH) {
+            it.draw_pixel_at(x + 1, y, Color(g1, g1, g1));
+          }
+
+          packed_index++;
+        };
+
+        while (
+          src_i < DASHBOARD_V4_RLE_SIZE &&
+          packed_index < DASHBOARD_V4_RAW_SIZE
+        ) {
+          uint8_t code = dashboard_v4_rle[src_i++];
+
+          if (code <= 127) {
+            int count = code + 1;
+            for (int i = 0; i < count; i++) {
+              emit_byte(dashboard_v4_rle[src_i++]);
+            }
+          } else if (code >= 129) {
+            int count = 257 - code;
+            uint8_t value = dashboard_v4_rle[src_i++];
+            for (int i = 0; i < count; i++) {
+              emit_byte(value);
+            }
+          }
+        }
+      };
+
+      // ----------------------------------------------------------------------
+      // Right-top white hole:
+      // date + time + greeting. The static subtitle underneath stays in PNG.
+      // ----------------------------------------------------------------------
+      auto draw_clock = [&]() {
+        // Source white hole ~= (1134,36)-(1375,240)
+        // E1003 ~= (1516,47)-(1828,310)  [shifted +50px right]
+        it.filled_rectangle(1516, 47, 312, 263, WHITE);
+
+        auto now = id(rtc_time).now();
+
+        if (now.is_valid()) {
+          it.strftime(
+            1802, 62,
+            id(font_medium), BLACK,
+            TextAlign::TOP_RIGHT,
+            "%a, %b %d, %Y",
+            now
+          );
+
+          it.strftime(
+            1802, 125,
+            id(font_number), BLACK,
+            TextAlign::TOP_RIGHT,
+            "%H:%M",
+            now
+          );
+
+          const char *greeting =
+            now.hour < 12 ? "Good Morning" :
+            now.hour < 18 ? "Good Afternoon" :
+                            "Good Evening";
+
+          it.printf(
+            1545, 256,
+            id(font_medium), BLACK,
+            "%s",
+            greeting
+          );
+        }
+      };
+
+      // ----------------------------------------------------------------------
+      // Environment: only the numbers are dynamic.
+      // Units/icons/trend graphics remain baked into the PNG.
+      // ----------------------------------------------------------------------
+      auto draw_environment = [&]() {
+        // Temperature numeric hole.
+        it.filled_rectangle(802, 518, 57, 56, WHITE);
+
+        if (id(temp_sensor).has_state()) {
+          it.printf(
+            830, 522,
+            id(font_large), BLACK,
+            TextAlign::TOP_CENTER,
+            "%.0f",
+            id(temp_sensor).state
+          );
+        } else {
+          it.printf(
+            830, 522,
+            id(font_large), BLACK,
+            TextAlign::TOP_CENTER,
+            "--"
+          );
+        }
+
+        // Humidity numeric hole.
+        it.filled_rectangle(1050, 518, 57, 56, WHITE);
+
+        if (id(hum_sensor).has_state()) {
+          it.printf(
+            1078, 522,
+            id(font_large), BLACK,
+            TextAlign::TOP_CENTER,
+            "%.0f",
+            id(hum_sensor).state
+          );
+        } else {
+          it.printf(
+            1078, 522,
+            id(font_large), BLACK,
+            TextAlign::TOP_CENTER,
+            "--"
+          );
+        }
+      };
+
+      // ----------------------------------------------------------------------
+      // Lights: state, toggle, brightness number and progress bar are dynamic.
+      // The four preset buttons themselves remain exactly as designed in PNG.
+      // ----------------------------------------------------------------------
+      auto draw_light = [&]() {
+        bool light_on =
+          id(ha_light_state).has_state() &&
+          id(ha_light_state).state == "on";
+
+        int brightness_pct = 0;
+
+        if (
+          id(ha_light_brightness).has_state() &&
+          !isnan(id(ha_light_brightness).state)
+        ) {
+          brightness_pct = (int) round(
+            id(ha_light_brightness).state / 255.0f * 100.0f
+          );
+
+          if (brightness_pct < 0) brightness_pct = 0;
+          if (brightness_pct > 100) brightness_pct = 100;
+        }
+
+        // Main Light state hole.
+        it.filled_rectangle(1375, 550, 90, 55, WHITE);
+        it.printf(
+          1420, 554,
+          id(font_medium), BLACK,
+          TextAlign::TOP_CENTER,
+          "%s",
+          light_on ? "On" : "Off"
+        );
+
+        // Power toggle hole.
+        it.filled_rectangle(1569, 513, 205, 91, WHITE);
+
+        if (light_on) {
+          it.filled_rectangle(1580, 525, 183, 67, BLACK);
+          it.printf(
+            1671, 534,
+            id(font_large), WHITE,
+            TextAlign::TOP_CENTER,
+            "On"
+          );
+        } else {
+          it.rectangle(1580, 525, 183, 67, G3);
+          it.printf(
+            1671, 534,
+            id(font_large), BLACK,
+            TextAlign::TOP_CENTER,
+            "Off"
+          );
+        }
+
+        // Brightness numeric hole.
+        it.filled_rectangle(1387, 673, 100, 36, WHITE);
+        it.printf(
+          1395, 673,
+          id(font_medium), BLACK,
+          TextAlign::TOP_LEFT,
+          "%d%%",
+          brightness_pct
+        );
+
+        // Brightness bar hole.
+        it.filled_rectangle(1501, 674, 277, 45, WHITE);
+
+        it.filled_rectangle(1510, 686, 258, 20, WHITE);
+
+        int active_w = (258 * brightness_pct) / 100;
+        if (active_w > 0) {
+          it.filled_rectangle(
+            1510, 686,
+            active_w, 20,
+            BLACK
+          );
+        }
+      };
+
+      // Footer: only HH:MM is dynamic; "Last Update" stays in the PNG.
+      auto draw_last_update = [&]() {
+        it.filled_rectangle(1706, 1324, 56, 34, WHITE);
+
+        auto now = id(rtc_time).now();
+
+        if (now.is_valid()) {
+          it.strftime(
+            1734, 1327,
+            id(font_tiny), BLACK,
+            TextAlign::TOP_CENTER,
+            "%H:%M",
+            now
+          );
+        }
+      };
+
+      // ======================================================================
+      // FIRST RENDER
+      // ======================================================================
+      if (id(ui_full_redraw)) {
+        draw_static_dashboard();
+        draw_clock();
+        draw_environment();
+        draw_light();
+        draw_last_update();
+
+        id(ui_full_redraw) = false;
+        id(ui_time_dirty) = false;
+        id(ui_env_dirty) = false;
+        id(ui_light_dirty) = false;
+        return;
+      }
+
+      // ======================================================================
+      // PARTIAL UPDATE PATH
+      // ======================================================================
+      if (id(ui_time_dirty)) {
+        draw_clock();
+        draw_last_update();
+        id(ui_time_dirty) = false;
+      }
+
+      if (id(ui_env_dirty)) {
+        draw_environment();
+        id(ui_env_dirty) = false;
+      }
+
+      if (id(ui_light_dirty)) {
+        draw_light();
+        draw_last_update();
+        id(ui_light_dirty) = false;
+      }
